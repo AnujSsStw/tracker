@@ -1,6 +1,5 @@
+import { sleep } from "bun";
 import TelegramBot from "node-telegram-bot-api";
-import { TransactionMonitor } from "./monitor";
-import type { Config } from "./types";
 
 const config: Config = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN!,
@@ -17,6 +16,21 @@ const config: Config = {
   POLLING_INTERVAL: 15, // in seconds
 };
 
-const monitor = new TransactionMonitor(config);
+const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, {
+  polling: false,
+});
 
-monitor.start();
+const messages = Array.from({ length: 10 }, async (_, i) => {
+  return await bot.sendMessage(config.MAIN_CHAT_ID, `Hello, world! ${i}`);
+});
+
+for (const message of messages) {
+  console.log("Sending message");
+  try {
+    const r = await Promise.allSettled(messages);
+    console.log(r);
+  } catch (error) {
+    console.error(error);
+  }
+  await sleep(2000);
+}
