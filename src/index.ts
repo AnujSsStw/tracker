@@ -1,4 +1,3 @@
-import TelegramBot from "node-telegram-bot-api";
 import { TransactionMonitor } from "./monitor";
 import type { Config } from "./types";
 
@@ -14,7 +13,7 @@ const config: Config = {
   },
 
   INITIAL_DAYS_TO_MONITOR: 1,
-  POLLING_INTERVAL: 15, // in seconds
+  POLLING_INTERVAL: parseInt(process.env.POLLING_INTERVAL!), // in seconds
 };
 
 const monitor = new TransactionMonitor(config);

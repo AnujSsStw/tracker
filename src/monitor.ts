@@ -69,79 +69,182 @@ export class TransactionMonitor {
   // 5 calls/second
   private async monitorContracts() {
     try {
-      const currentBlock = await this.etherscanApi.getLatestBlock(); // 1 api call
+      const currentBlock = await this.etherscanApi.getLatestBlock();
       if (!currentBlock) return;
-
       logger.info(`Latest block: ${currentBlock}`);
 
-      for (const [name, address] of Object.entries(this.config.ADDRESS)) {
-        // Initialize start block if this is the first check
+      // Initialize start blocks if needed
+      for (const [name, _] of Object.entries(this.config.ADDRESS)) {
         if (this.contractStats[name].lastBlockChecked === 0) {
           this.contractStats[name].lastBlockChecked =
             currentBlock - this.initialBlocksToFetch;
         }
+      }
 
-        const transactions = await this.etherscanApi.getContractTransactions(
-          address,
-          this.contractStats[name].lastBlockChecked
-          //   currentBlock
-        );
+      // Step 1: Fetch all transactions in parallel
+      const transactionPromises = Object.entries(this.config.ADDRESS).map(
+        async ([name, address]) => {
+          try {
+            const transactions =
+              await this.etherscanApi.getContractTransactions(
+                address,
+                this.contractStats[name].lastBlockChecked
+              );
 
-        if (transactions.length > 0) {
-          console.log(
-            `\nProcessing ${transactions.length} transactions for ${name}:`
-          );
-          // Group transactions by block
-          const lastThreeTx = transactions.slice(-3);
-          const txsByBlock = lastThreeTx.reduce(
-            (acc: Record<string, EtherscanTx[]>, tx) => {
-              if (!acc[tx.blockNumber]) {
-                acc[tx.blockNumber] = [];
+            // Limit to latest 5 transactions if more exist
+            const limit = parseInt(process.env.LIMIT_TRANSACTIONS!);
+            const limitedTransactions =
+              transactions.length > limit
+                ? transactions.slice(-limit) // Take last 5 transactions
+                : transactions;
+
+            return {
+              name,
+              transactions: limitedTransactions,
+              totalFound: transactions.length,
+              maxBlock:
+                transactions.length > 0
+                  ? Math.max(
+                      ...transactions.map((tx) => parseInt(tx.blockNumber))
+                    )
+                  : null,
+            };
+          } catch (error) {
+            console.error(`Error fetching transactions for ${name}:`, error);
+            return {
+              name,
+              transactions: [],
+              totalFound: 0,
+              maxBlock: null,
+            };
+          }
+        }
+      );
+
+      // Wait for all transaction fetches to complete
+      const contractTransactions = await Promise.all(transactionPromises);
+
+      // Step 2: Process transactions and prepare messages in parallel
+      const processingPromises = contractTransactions
+        .filter(({ transactions }) => transactions.length > 0)
+        .map(async ({ name, transactions, totalFound, maxBlock }) => {
+          try {
+            console.log(
+              `\nProcessing ${
+                transactions.length
+              } out of ${totalFound} transactions for ${name}${
+                totalFound > 5 ? " (limited to latest 5)" : ""
+              }`
+            );
+
+            // Group transactions by block
+            const txsByBlock = transactions.reduce(
+              (acc: Record<string, EtherscanTx[]>, tx) => {
+                if (!acc[tx.blockNumber]) {
+                  acc[tx.blockNumber] = [];
+                }
+                acc[tx.blockNumber].push(tx);
+                return acc;
+              },
+              {}
+            );
+
+            // Process each block's transactions and prepare messages
+            const messages: string[] = [];
+            const copyWalletMessages: string[] = [];
+
+            await Promise.all(
+              Object.entries(txsByBlock).map(async ([blockNum, blockTxs]) => {
+                const totalEth = blockTxs.reduce(
+                  (sum, tx) => sum + parseFloat(tx.value) / 1e18,
+                  0
+                );
+                const values = blockTxs.map(
+                  (tx) => parseFloat(tx.value) / 1e18
+                );
+                const pattern = this.detectPattern(values);
+
+                messages.push(
+                  this.createMessage(
+                    name,
+                    blockTxs,
+                    blockNum,
+                    totalEth,
+                    pattern
+                  )
+                );
+
+                if (blockTxs.length > 1) {
+                  const minReceiver = this.findMinEthReceiver(blockTxs);
+                  copyWalletMessages.push(
+                    `Wallet that received least ETH: ${minReceiver} in block ${blockNum}`
+                  );
+                }
+              })
+            );
+
+            return {
+              name,
+              messages,
+              copyWalletMessages,
+              maxBlock: maxBlock ? maxBlock + 1 : currentBlock,
+            };
+          } catch (error) {
+            console.error(`Error processing transactions for ${name}:`, error);
+            return {
+              name,
+              messages: [] as string[],
+              copyWalletMessages: [],
+              maxBlock: this.contractStats[name].lastBlockChecked,
+            };
+          }
+        });
+
+      // Wait for all processing to complete
+      const results = await Promise.all(processingPromises);
+
+      // Step 3: Send messages in parallel and update block numbers
+      await Promise.all(
+        results.map(
+          async ({ name, messages, copyWalletMessages, maxBlock }) => {
+            const sendPromises: Promise<void>[] = [];
+
+            if (messages.length > 0) {
+              if (messages.length > 5) {
+                messages.unshift(
+                  `⚠️ Found ${messages.length} transactions. Showing latest 5 only.`
+                );
               }
-              acc[tx.blockNumber].push(tx);
-              return acc;
-            },
-            {} as Record<string, EtherscanTx[]>
-          );
-
-          // Process each block's transactions
-          const messages: string[] = [];
-          for (const [blockNum, blockTxs] of Object.entries(txsByBlock)) {
-            const totalEth = blockTxs.reduce(
-              (sum, tx) => sum + parseFloat(tx.value) / 1e18,
-              0
-            );
-
-            const values = blockTxs.map((tx) => parseFloat(tx.value) / 1e18);
-            const pattern = this.detectPattern(values);
-
-            messages.push(
-              this.createMessage(name, blockTxs, blockNum, totalEth, pattern)
-            );
-
-            if (blockTxs.length > 1) {
-              const minReceiver = this.findMinEthReceiver(blockTxs);
-              await this.bot.sendMessage(
-                [
-                  `Wallet that received least ETH: ${minReceiver} in block ${blockNum}`,
-                ],
-                this.config.COPY_WALLET_CHAT_ID
+              sendPromises.push(
+                this.bot.sendMessage(messages, this.config.MAIN_CHAT_ID)
               );
             }
-          }
-          await this.bot.sendMessage(messages, this.config.MAIN_CHAT_ID);
 
-          // Update last checked block
-          const maxBlock = Math.max(
-            ...transactions.map((tx) => parseInt(tx.blockNumber))
-          );
-          this.contractStats[name].lastBlockChecked = maxBlock + 1;
-        } else {
+            if (copyWalletMessages.length > 0) {
+              sendPromises.push(
+                this.bot.sendMessage(
+                  copyWalletMessages,
+                  this.config.COPY_WALLET_CHAT_ID
+                )
+              );
+            }
+
+            // Wait for messages to be sent
+            await Promise.all(sendPromises);
+
+            // Update last checked block
+            this.contractStats[name].lastBlockChecked = maxBlock;
+          }
+        )
+      );
+
+      // Update contracts with no transactions
+      contractTransactions
+        .filter(({ transactions }) => transactions.length === 0)
+        .forEach(({ name }) => {
           this.contractStats[name].lastBlockChecked = currentBlock;
           console.log(`No transactions found for ${name}`);
-        }
-        await sleep(1000);
-      }
+        });
     } catch (error: any) {
       console.error("Error in monitoring:", error.message);
     }
