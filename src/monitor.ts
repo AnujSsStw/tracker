@@ -1,7 +1,7 @@
 import { Bot } from "./bot";
 import { EtherscanAPI } from "./ether-scan";
 import { logger } from "./logger";
-import type { Config, EtherscanTx } from "./types";
+import type { Config, EtherscanTx, EtherscanTxInternal } from "./types";
 
 interface PatternAnalysis {
   type:
@@ -26,6 +26,7 @@ export class TransactionMonitor {
   private contractStats: Record<string, any>;
   private etherscanApi: EtherscanAPI;
   private config: Config;
+  private minTransactions = 20;
 
   constructor(config: Config) {
     this.config = config;
@@ -63,7 +64,6 @@ export class TransactionMonitor {
 
   // 5 calls/second
   private async monitorContracts() {
-    const BLOCK_RANGE_SIZE = 50; // Configurable range size
     try {
       const currentBlock = await this.etherscanApi.getLatestBlock();
       if (!currentBlock) return;
@@ -83,20 +83,14 @@ export class TransactionMonitor {
         async ([name, address]) => {
           try {
             const transactions =
-              await this.etherscanApi.getContractTransactions(
+              await this.etherscanApi.getInternalTransactions(
                 address,
                 this.contractStats[name].lastBlockChecked
               );
 
-            // Limit to latest 5 transactions if more exist
-            const limitedTransactions =
-              transactions.length > limit
-                ? transactions.slice(-limit) // Take last 5 transactions
-                : transactions;
-
             return {
               name,
-              transactions: limitedTransactions,
+              transactions,
               totalFound: transactions.length,
               maxBlock:
                 transactions.length > 0
@@ -133,20 +127,24 @@ export class TransactionMonitor {
               }`
             );
 
-            // Group transactions by block range instead of individual blocks
-            const txsByRange = transactions.reduce(
-              (acc: Record<string, EtherscanTx[]>, tx) => {
-                const blockRange = getBlockRange(
-                  parseInt(tx.blockNumber),
-                  BLOCK_RANGE_SIZE
-                );
-                if (!acc[blockRange]) {
-                  acc[blockRange] = [];
+            // Group transactions by block
+            const txsByBlock = transactions.reduce(
+              (acc: Record<string, EtherscanTxInternal[]>, tx) => {
+                if (!acc[tx.blockNumber]) {
+                  acc[tx.blockNumber] = [];
                 }
-                acc[blockRange].push(tx);
+                acc[tx.blockNumber].push(tx);
                 return acc;
               },
               {}
+            );
+
+            // if the number of transactions for a block is greater than the limit, only show the latest 5 transactions
+
+            console.log(
+              `Found ${
+                Object.keys(txsByBlock).length
+              } blocks and block is ${Object.keys(txsByBlock)}`
             );
 
             // Process each block's transactions and prepare messages
@@ -154,36 +152,35 @@ export class TransactionMonitor {
             const copyWalletMessages: string[] = [];
 
             await Promise.all(
-              Object.entries(txsByRange).map(async ([blockRange, rangeTxs]) => {
-                // Sort transactions within range by block number
-                rangeTxs.sort(
-                  (a, b) => parseInt(a.blockNumber) - parseInt(b.blockNumber)
-                );
+              Object.entries(txsByBlock).map(async ([blockNum, blockTxs]) => {
+                if (blockTxs.length >= this.minTransactions) {
+                  console.log(
+                    `Processing block ${blockNum} with ${blockTxs.length} transactions`
+                  );
+                  const totalEth = blockTxs.reduce(
+                    (sum, tx) => sum + parseFloat(tx.value) / 1e18,
+                    0
+                  );
+                  const values = blockTxs.map(
+                    (tx) => parseFloat(tx.value) / 1e18
+                  );
+                  const pattern = this.detectPattern(values);
 
-                const totalEth = rangeTxs.reduce(
-                  (sum, tx) => sum + parseFloat(tx.value) / 1e18,
-                  0
-                );
-                const values = rangeTxs.map(
-                  (tx) => parseFloat(tx.value) / 1e18
-                );
-                const pattern = this.detectPattern(values);
+                  messages.push(
+                    this.createMessage(
+                      name,
+                      blockTxs,
+                      blockNum,
+                      totalEth,
+                      pattern
+                    )
+                  );
 
-                messages.push(
-                  this.createMessage(
-                    name,
-                    rangeTxs,
-                    totalEth,
-                    pattern,
-                    blockRange,
-                    getDateRange(rangeTxs).formattedRange
-                  )
-                );
+                  const minReceiver = this.findMinEthReceiver(blockTxs);
+                  console.log(minReceiver);
 
-                if (rangeTxs.length > 1) {
-                  const minReceiver = this.findMinEthReceiver(rangeTxs);
                   copyWalletMessages.push(
-                    `Wallet that received least ETH in range \`${blockRange}: ${minReceiver}\``
+                    `Wallet that received least ETH in range: \`${minReceiver.value} ETH\` → \`(${minReceiver.to})\`[View Wallet](https://app.zerion.io/${minReceiver.to}/history)`
                   );
                 }
               })
@@ -216,11 +213,11 @@ export class TransactionMonitor {
             const sendPromises: Promise<void>[] = [];
 
             if (messages.length > 0) {
-              if (messages.length > limit) {
-                messages.unshift(
-                  `⚠️ Found \`${messages.length}\` transactions. Showing latest 5 only.`
-                );
-              }
+              // if (messages.length > limit) {
+              //   messages.unshift(
+              //     `⚠️ Found \`${messages.length}\` transactions. Showing latest 5 only.`
+              //   );
+              // }
               sendPromises.push(
                 this.bot.sendMessage(messages, this.config.MAIN_CHAT_ID)
               );
@@ -256,21 +253,40 @@ export class TransactionMonitor {
     }
   }
 
+  private async filterNewWallets(
+    transactions: EtherscanTxInternal[]
+  ): Promise<EtherscanTxInternal[]> {
+    const newWalletTxs: EtherscanTxInternal[] = [];
+    const walletStats: Record<string, number> = {};
+
+    for (const tx of transactions) {
+      if (!walletStats[tx.to]) {
+        walletStats[tx.to] = 1;
+        newWalletTxs.push(tx);
+      } else {
+        walletStats[tx.to]++;
+      }
+    }
+
+    return newWalletTxs.filter((tx) => walletStats[tx.to] >= 20);
+  }
+
   private createMessage(
     name: string,
-    blockTxs: EtherscanTx[],
+    blockTxs: EtherscanTxInternal[],
+    blockNum: string,
     totalEth: number,
-    pattern: string,
-    blockRange: string,
-    timeStamp: string
+    pattern: string
   ): string {
     // Escape special characters for MarkdownV2
     const escapedPattern = pattern.replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 
     return `*${name} Transaction Detected* 🔔
 
-• 📊Block Range: \`${blockRange}\`
-• Timestamp: \`${timeStamp}\`
+• Block Number: \`${blockNum}\`
+• Timestamp: \`${new Date(
+      parseInt(blockTxs[0].timeStamp) * 1000
+    ).toLocaleString()}\`
 • Total Transactions: \`${blockTxs.length}\`
 • Total ETH: \`${totalEth.toFixed(4)} ETH\`
 • Avg ETH per tx: \`${(totalEth / blockTxs.length).toFixed(4)}\`
@@ -280,7 +296,7 @@ export class TransactionMonitor {
 ${blockTxs
   .map((tx) => {
     const ethValue = (parseFloat(tx.value) / 1e18).toFixed(4);
-    return `• \`${ethValue} ETH\` → [View Wallet](https://app.zerion.io/${tx.from}/history)`;
+    return `• \`${ethValue} ETH\` → [View Wallet](https://app.zerion.io/${tx.to}/history)`;
   })
   .join("\n")}`;
   }
@@ -425,11 +441,17 @@ ${blockTxs
     }
   }
 
-  private findMinEthReceiver(transactions: EtherscanTx[]): string {
+  private findMinEthReceiver(transactions: EtherscanTxInternal[]): {
+    to: string;
+    value: string;
+  } {
     const minTx = transactions.reduce((min, tx) =>
       parseFloat(tx.value) < parseFloat(min.value) ? tx : min
     );
-    return minTx.to;
+    return {
+      to: minTx.to,
+      value: (parseFloat(minTx.value) / 1e18).toFixed(4),
+    };
   }
 }
 

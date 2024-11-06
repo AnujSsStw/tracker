@@ -1,5 +1,7 @@
 import { sleep } from "bun";
 import TelegramBot from "node-telegram-bot-api";
+import { EtherscanAPI } from "./src/ether-scan";
+import type { Config } from "./src/types";
 
 const config: Config = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN!,
@@ -16,21 +18,21 @@ const config: Config = {
   POLLING_INTERVAL: 15, // in seconds
 };
 
-const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, {
-  polling: false,
-});
+const api = new EtherscanAPI(config.ETHERSCAN_API_KEY);
+// api
+//   .getContractTransactions(
+//     "0xCEC8F07014d889442D7Cf3b477b8F72f8179eA09",
+//     21126973
+//   )
+//   .then((txs) => {
+//     txs.forEach((tx) => {
+//       console.log(tx.from);
+//       console.log(tx.functionName);
+//     });
+//   });
 
-const messages = Array.from({ length: 10 }, async (_, i) => {
-  return await bot.sendMessage(config.MAIN_CHAT_ID, `Hello, world! ${i}`);
+api.getInternalTransactions(config.ADDRESS.DISPERSE, 21121982).then((txs) => {
+  txs.forEach((tx) => {
+    console.log(tx);
+  });
 });
-
-for (const message of messages) {
-  console.log("Sending message");
-  try {
-    const r = await Promise.allSettled(messages);
-    console.log(r);
-  } catch (error) {
-    console.error(error);
-  }
-  await sleep(2000);
-}

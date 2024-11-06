@@ -1,6 +1,6 @@
 import axios from "axios";
 import { logger } from "./logger";
-import type { EtherscanTx } from "./types";
+import type { EtherscanTx, EtherscanTxInternal } from "./types";
 
 export class EtherscanAPI {
   private readonly baseURL = "https://api.etherscan.io/api";
@@ -37,18 +37,25 @@ export class EtherscanAPI {
     }
   }
 
-  async getInternalTransactions(txHash: string): Promise<any[]> {
+  async getInternalTransactions(
+    address: string,
+    block: number
+  ): Promise<EtherscanTxInternal[]> {
     try {
       const response = await axios.get(this.baseURL, {
         params: {
           module: "account",
           action: "txlistinternal",
-          txhash: txHash,
+          address,
+          startblock: block,
+          sort: "asc",
           apikey: this.apiKey,
         },
       });
 
       if (response.data.status === "1" && response.data.result) {
+        console.log(response.data.result.length, "block");
+
         return response.data.result;
       }
       return [];
