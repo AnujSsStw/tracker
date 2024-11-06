@@ -14,6 +14,8 @@ const config: Config = {
 
   INITIAL_DAYS_TO_MONITOR: 1,
   POLLING_INTERVAL: parseInt(process.env.POLLING_INTERVAL!), // in seconds
+
+  MIN_TRANSACTION_AMOUNT: parseFloat(process.env.MIN_TRANSACTION_AMOUNT!),
 };
 
 const monitor = new TransactionMonitor(config);

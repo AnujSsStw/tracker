@@ -1,6 +1,7 @@
 import axios from "axios";
 import { logger } from "./logger";
 import type { EtherscanTx, EtherscanTxInternal } from "./types";
+import { Alchemy, Network } from "alchemy-sdk";
 
 export class EtherscanAPI {
   private readonly baseURL = "https://api.etherscan.io/api";
@@ -83,3 +84,9 @@ export class EtherscanAPI {
     }
   }
 }
+
+const config = {
+  apiKey: process.env.ALCHEMEY_API_KEY!,
+  network: Network.ETH_MAINNET,
+};
+export const alchemy = new Alchemy(config);

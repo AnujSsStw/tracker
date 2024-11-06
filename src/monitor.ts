@@ -1,7 +1,9 @@
+import { AssetTransfersCategory } from "alchemy-sdk";
+import { Mutex } from "async-mutex";
 import { Bot } from "./bot";
-import { EtherscanAPI } from "./ether-scan";
+import { alchemy, EtherscanAPI } from "./ether-scan";
 import { logger } from "./logger";
-import type { Config, EtherscanTx, EtherscanTxInternal } from "./types";
+import type { Config, EtherscanTxInternal } from "./types";
 
 interface PatternAnalysis {
   type:
@@ -27,6 +29,8 @@ export class TransactionMonitor {
   private etherscanApi: EtherscanAPI;
   private config: Config;
   private minTransactions = 20;
+
+  private mutex = new Mutex();
 
   constructor(config: Config) {
     this.config = config;
@@ -139,8 +143,6 @@ export class TransactionMonitor {
               {}
             );
 
-            // if the number of transactions for a block is greater than the limit, only show the latest 5 transactions
-
             console.log(
               `Found ${
                 Object.keys(txsByBlock).length
@@ -153,7 +155,33 @@ export class TransactionMonitor {
 
             await Promise.all(
               Object.entries(txsByBlock).map(async ([blockNum, blockTxs]) => {
-                if (blockTxs.length >= this.minTransactions) {
+                if (
+                  blockTxs.length >= this.minTransactions &&
+                  blockTxs.every(
+                    (tx) =>
+                      parseFloat(tx.value) / 1e18 >=
+                      this.config.MIN_TRANSACTION_AMOUNT
+                  )
+                ) {
+                  const randomWallets = blockTxs
+                    .map((tx) => tx.to)
+                    .sort(() => 0.5 - Math.random())
+                    .slice(0, 1);
+
+                  if (
+                    await this.checkOldTransactions(
+                      randomWallets,
+                      blockTxs[0].from
+                    )
+                  ) {
+                    blockTxs.forEach((tx) => {
+                      console.log(
+                        `Old wallet detected: ${tx.to} with hash ${tx.hash}`
+                      );
+                    });
+                    return;
+                  }
+
                   console.log(
                     `Processing block ${blockNum} with ${blockTxs.length} transactions`
                   );
@@ -177,8 +205,6 @@ export class TransactionMonitor {
                   );
 
                   const minReceiver = this.findMinEthReceiver(blockTxs);
-                  console.log(minReceiver);
-
                   copyWalletMessages.push(
                     `Wallet that received least ETH in range: \`${minReceiver.value} ETH\` → \`(${minReceiver.to})\`[View Wallet](https://app.zerion.io/${minReceiver.to}/history)`
                   );
@@ -253,22 +279,32 @@ export class TransactionMonitor {
     }
   }
 
-  private async filterNewWallets(
-    transactions: EtherscanTxInternal[]
-  ): Promise<EtherscanTxInternal[]> {
-    const newWalletTxs: EtherscanTxInternal[] = [];
-    const walletStats: Record<string, number> = {};
+  private async checkOldTransactions(
+    wallets: string[],
+    address: string
+  ): Promise<boolean> {
+    const release = await this.mutex.acquire();
+    try {
+      for (const wallet of wallets) {
+        const transactions = await alchemy.core.getAssetTransfers({
+          fromAddress: address,
+          toAddress: wallet,
+          excludeZeroValue: true,
+          category: [AssetTransfersCategory.INTERNAL],
+        });
 
-    for (const tx of transactions) {
-      if (!walletStats[tx.to]) {
-        walletStats[tx.to] = 1;
-        newWalletTxs.push(tx);
-      } else {
-        walletStats[tx.to]++;
+        if (transactions.transfers.length > 1) {
+          release();
+          return true;
+        }
       }
+      release();
+      return false;
+    } catch (error) {
+      console.error("Error checking old transactions:", error);
+      release();
+      return false;
     }
-
-    return newWalletTxs.filter((tx) => walletStats[tx.to] >= 20);
   }
 
   private createMessage(
@@ -453,47 +489,4 @@ ${blockTxs
       value: (parseFloat(minTx.value) / 1e18).toFixed(4),
     };
   }
-}
-
-// Helper function to group blocks into ranges
-function getBlockRange(blockNumber: number, rangeSize: number = 50): string {
-  const startBlock = Math.floor(blockNumber / rangeSize) * rangeSize;
-  const endBlock = startBlock + rangeSize - 1;
-  return `${startBlock}-${endBlock}`;
-}
-
-function getDateRange(transactions: EtherscanTx[]): {
-  startDate: string;
-  endDate: string;
-  formattedRange: string;
-} {
-  if (!transactions.length) {
-    return {
-      startDate: "",
-      endDate: "",
-      formattedRange: "No transactions",
-    };
-  }
-
-  const timestamps = transactions.map((tx) => parseInt(tx.timeStamp));
-  const minTimestamp = Math.min(...timestamps);
-  const maxTimestamp = Math.max(...timestamps);
-
-  const startDate = new Date(minTimestamp * 1000).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-  });
-  const endDate = new Date(maxTimestamp * 1000).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-  });
-
-  const formattedRange =
-    startDate === endDate ? startDate : `${startDate} - ${endDate}`;
-
-  return {
-    startDate,
-    endDate,
-    formattedRange,
-  };
 }

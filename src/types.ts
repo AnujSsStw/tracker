@@ -10,6 +10,7 @@ export interface Config {
   };
   INITIAL_DAYS_TO_MONITOR: number;
   POLLING_INTERVAL: number;
+  MIN_TRANSACTION_AMOUNT: number;
 }
 
 export interface EtherscanTx {

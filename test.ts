@@ -1,7 +1,8 @@
 import { sleep } from "bun";
 import TelegramBot from "node-telegram-bot-api";
-import { EtherscanAPI } from "./src/ether-scan";
+import { alchemy, EtherscanAPI } from "./src/ether-scan";
 import type { Config } from "./src/types";
+import { AssetTransfersCategory } from "alchemy-sdk";
 
 const config: Config = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN!,
@@ -31,8 +32,51 @@ const api = new EtherscanAPI(config.ETHERSCAN_API_KEY);
 //     });
 //   });
 
-api.getInternalTransactions(config.ADDRESS.DISPERSE, 21121982).then((txs) => {
-  txs.forEach((tx) => {
-    console.log(tx);
-  });
-});
+// api.getInternalTransactions(config.ADDRESS.DISPERSE, 21121982).then((txs) => {
+//   txs.forEach((tx) => {
+//     console.log(tx);
+//   });
+// });
+
+async function checkOldTransactions(
+  wallets: string[],
+  address: string
+): Promise<boolean> {
+  try {
+    // Use the Alchemy API to check if any of the wallets have had previous transactions
+    // with the monitored addresses
+    for (const wallet of wallets) {
+      const transactions = await alchemy.core.getAssetTransfers({
+        fromAddress: address,
+        toAddress: wallet,
+        excludeZeroValue: true,
+        category: [AssetTransfersCategory.INTERNAL],
+      });
+      console.log(transactions);
+
+      if (transactions.transfers.length > 1) {
+        return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    console.error("Error checking old transactions:", error);
+    return false;
+  }
+}
+
+// checkOldTransactions(
+//   [
+//     "0xbddf7bdd935fc69b1e8bc055cc1de9107ff452e9",
+//     "0x00000000000030e5959659622cb7eb50aa20ee52",
+//   ],
+//   config.ADDRESS.DISPERSE
+// ).then((result) => {
+//   console.log(result);
+// });
+
+const res = await fetch(
+  `https://api.etherscan.io/api?module=account&action=txlisttxlistinternal&address=${config.ADDRESS.DISPERSE}&startblock=0&endblock=99999999&sort=asc&apikey=${config.ETHERSCAN_API_KEY}`
+);
+const data = await res.json();
+console.log(data);
