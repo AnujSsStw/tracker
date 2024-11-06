@@ -216,9 +216,9 @@ export class TransactionMonitor {
             const sendPromises: Promise<void>[] = [];
 
             if (messages.length > 0) {
-              if (messages.length > 5) {
+              if (messages.length > limit) {
                 messages.unshift(
-                  `⚠️ Found ${messages.length} transactions. Showing latest 5 only.`
+                  `⚠️ Found \`${messages.length}\` transactions. Showing latest 5 only.`
                 );
               }
               sendPromises.push(
@@ -280,7 +280,7 @@ export class TransactionMonitor {
 ${blockTxs
   .map((tx) => {
     const ethValue = (parseFloat(tx.value) / 1e18).toFixed(4);
-    return `• \`${ethValue} ETH\` → [View Wallet](https://etherscan.io/address/${tx.to})`;
+    return `• \`${ethValue} ETH\` → [View Wallet](https://app.zerion.io/${tx.from}/history)`;
   })
   .join("\n")}`;
   }
