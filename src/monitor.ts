@@ -1,9 +1,7 @@
-import TelegramBot from "node-telegram-bot-api";
-import type { Config, EtherscanTx } from "./types";
+import { Bot } from "./bot";
 import { EtherscanAPI } from "./ether-scan";
 import { logger } from "./logger";
-import { Bot } from "./bot";
-import { sleep } from "bun";
+import type { Config, EtherscanTx } from "./types";
 
 interface PatternAnalysis {
   type:
@@ -26,9 +24,6 @@ export class TransactionMonitor {
   private blocksPerDay: number;
   private initialBlocksToFetch: number;
   private contractStats: Record<string, any>;
-  private messageQueue: { message: string; retries: number }[] = [];
-  private isProcessingQueue: boolean = false;
-  private readonly MAX_RETRIES = 3;
   private etherscanApi: EtherscanAPI;
   private config: Config;
 
@@ -68,6 +63,7 @@ export class TransactionMonitor {
 
   // 5 calls/second
   private async monitorContracts() {
+    const BLOCK_RANGE_SIZE = 50; // Configurable range size
     try {
       const currentBlock = await this.etherscanApi.getLatestBlock();
       if (!currentBlock) return;
@@ -80,6 +76,7 @@ export class TransactionMonitor {
             currentBlock - this.initialBlocksToFetch;
         }
       }
+      const limit = parseInt(process.env.LIMIT_TRANSACTIONS!);
 
       // Step 1: Fetch all transactions in parallel
       const transactionPromises = Object.entries(this.config.ADDRESS).map(
@@ -92,7 +89,6 @@ export class TransactionMonitor {
               );
 
             // Limit to latest 5 transactions if more exist
-            const limit = parseInt(process.env.LIMIT_TRANSACTIONS!);
             const limitedTransactions =
               transactions.length > limit
                 ? transactions.slice(-limit) // Take last 5 transactions
@@ -133,17 +129,21 @@ export class TransactionMonitor {
               `\nProcessing ${
                 transactions.length
               } out of ${totalFound} transactions for ${name}${
-                totalFound > 5 ? " (limited to latest 5)" : ""
+                totalFound > limit ? " (limited to latest 5)" : ""
               }`
             );
 
-            // Group transactions by block
-            const txsByBlock = transactions.reduce(
+            // Group transactions by block range instead of individual blocks
+            const txsByRange = transactions.reduce(
               (acc: Record<string, EtherscanTx[]>, tx) => {
-                if (!acc[tx.blockNumber]) {
-                  acc[tx.blockNumber] = [];
+                const blockRange = getBlockRange(
+                  parseInt(tx.blockNumber),
+                  BLOCK_RANGE_SIZE
+                );
+                if (!acc[blockRange]) {
+                  acc[blockRange] = [];
                 }
-                acc[tx.blockNumber].push(tx);
+                acc[blockRange].push(tx);
                 return acc;
               },
               {}
@@ -154,12 +154,17 @@ export class TransactionMonitor {
             const copyWalletMessages: string[] = [];
 
             await Promise.all(
-              Object.entries(txsByBlock).map(async ([blockNum, blockTxs]) => {
-                const totalEth = blockTxs.reduce(
+              Object.entries(txsByRange).map(async ([blockRange, rangeTxs]) => {
+                // Sort transactions within range by block number
+                rangeTxs.sort(
+                  (a, b) => parseInt(a.blockNumber) - parseInt(b.blockNumber)
+                );
+
+                const totalEth = rangeTxs.reduce(
                   (sum, tx) => sum + parseFloat(tx.value) / 1e18,
                   0
                 );
-                const values = blockTxs.map(
+                const values = rangeTxs.map(
                   (tx) => parseFloat(tx.value) / 1e18
                 );
                 const pattern = this.detectPattern(values);
@@ -167,17 +172,18 @@ export class TransactionMonitor {
                 messages.push(
                   this.createMessage(
                     name,
-                    blockTxs,
-                    blockNum,
+                    rangeTxs,
                     totalEth,
-                    pattern
+                    pattern,
+                    blockRange,
+                    getDateRange(rangeTxs).formattedRange
                   )
                 );
 
-                if (blockTxs.length > 1) {
-                  const minReceiver = this.findMinEthReceiver(blockTxs);
+                if (rangeTxs.length > 1) {
+                  const minReceiver = this.findMinEthReceiver(rangeTxs);
                   copyWalletMessages.push(
-                    `Wallet that received least ETH: ${minReceiver} in block ${blockNum}`
+                    `Wallet that received least ETH in range \`${blockRange}: ${minReceiver}\``
                   );
                 }
               })
@@ -253,29 +259,28 @@ export class TransactionMonitor {
   private createMessage(
     name: string,
     blockTxs: EtherscanTx[],
-    blockNum: string,
     totalEth: number,
-    pattern: string
+    pattern: string,
+    blockRange: string,
+    timeStamp: string
   ): string {
     // Escape special characters for MarkdownV2
     const escapedPattern = pattern.replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 
     return `*${name} Transaction Detected* 🔔
 
-*Block Details*
-• Block Number: \`${blockNum}\`
-• Timestamp: \`${new Date(
-      parseInt(blockTxs[0].timeStamp) * 1000
-    ).toLocaleString()}\`
+• 📊Block Range: \`${blockRange}\`
+• Timestamp: \`${timeStamp}\`
 • Total Transactions: \`${blockTxs.length}\`
 • Total ETH: \`${totalEth.toFixed(4)} ETH\`
+• Avg ETH per tx: \`${(totalEth / blockTxs.length).toFixed(4)}\`
 • Pattern: \`${escapedPattern}\`
 
-*Transaction Details*
+*Transaction: *
 ${blockTxs
   .map((tx) => {
     const ethValue = (parseFloat(tx.value) / 1e18).toFixed(4);
-    return `• \`${ethValue} ETH\` → [View Wallet](https://app.zerion.io/${tx.to}/history)`;
+    return `• \`${ethValue} ETH\` → [View Wallet](https://etherscan.io/address/${tx.to})`;
   })
   .join("\n")}`;
   }
@@ -426,4 +431,47 @@ ${blockTxs
     );
     return minTx.to;
   }
+}
+
+// Helper function to group blocks into ranges
+function getBlockRange(blockNumber: number, rangeSize: number = 50): string {
+  const startBlock = Math.floor(blockNumber / rangeSize) * rangeSize;
+  const endBlock = startBlock + rangeSize - 1;
+  return `${startBlock}-${endBlock}`;
+}
+
+function getDateRange(transactions: EtherscanTx[]): {
+  startDate: string;
+  endDate: string;
+  formattedRange: string;
+} {
+  if (!transactions.length) {
+    return {
+      startDate: "",
+      endDate: "",
+      formattedRange: "No transactions",
+    };
+  }
+
+  const timestamps = transactions.map((tx) => parseInt(tx.timeStamp));
+  const minTimestamp = Math.min(...timestamps);
+  const maxTimestamp = Math.max(...timestamps);
+
+  const startDate = new Date(minTimestamp * 1000).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+  const endDate = new Date(maxTimestamp * 1000).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+
+  const formattedRange =
+    startDate === endDate ? startDate : `${startDate} - ${endDate}`;
+
+  return {
+    startDate,
+    endDate,
+    formattedRange,
+  };
 }

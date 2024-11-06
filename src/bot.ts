@@ -38,7 +38,9 @@ export class Bot {
     }
   }
 
-  private async sendSingleMessage(queuedMessage: QueuedMessage): Promise<boolean> {
+  private async sendSingleMessage(
+    queuedMessage: QueuedMessage
+  ): Promise<boolean> {
     try {
       await this.bot.sendMessage(queuedMessage.chatId, queuedMessage.message, {
         parse_mode: "MarkdownV2",
@@ -52,13 +54,21 @@ export class Bot {
         errorMessage.includes("429") ||
         errorMessage.includes("Too Many Requests")
       ) {
-        console.log(`Rate limited. Waiting ${this.RATE_LIMIT_WAIT_TIME/1000} seconds before retry...`);
+        console.log(
+          `Rate limited. Waiting ${
+            this.RATE_LIMIT_WAIT_TIME / 1000
+          } seconds before retry...`
+        );
         await sleep(this.RATE_LIMIT_WAIT_TIME);
         return false;
       }
 
       if (queuedMessage.retryCount < this.MAX_RETRIES) {
-        console.log(`Error sending message, attempt ${queuedMessage.retryCount + 1}/${this.MAX_RETRIES}`);
+        console.log(
+          `Error sending message, attempt ${queuedMessage.retryCount + 1}/${
+            this.MAX_RETRIES
+          }`
+        );
         queuedMessage.retryCount++;
         return false;
       }
@@ -66,7 +76,7 @@ export class Bot {
       console.error("Failed to send message after max retries:", {
         error: errorMessage,
         message: queuedMessage.message,
-        chatId: queuedMessage.chatId
+        chatId: queuedMessage.chatId,
       });
       return true; // Remove from queue after max retries
     }
@@ -98,7 +108,9 @@ export class Bot {
   async sendMessage(messages: string[], chatId: string): Promise<void> {
     // Validate inputs
     if (!Array.isArray(messages) || !chatId) {
-      throw new Error("Invalid input: messages must be an array and chatId must be provided");
+      throw new Error(
+        "Invalid input: messages must be an array and chatId must be provided"
+      );
     }
 
     // Add messages to queue
@@ -106,8 +118,8 @@ export class Bot {
       if (typeof message === "string" && message.trim()) {
         this.messageQueue.push({
           message: message.trim(),
-                               chatId,
-                               retryCount: 0
+          chatId,
+          retryCount: 0,
         });
       }
     }
@@ -124,7 +136,7 @@ export class Bot {
   getQueueStatus(): { queueLength: number; isProcessing: boolean } {
     return {
       queueLength: this.messageQueue.length,
-      isProcessing: this.isProcessingQueue
+      isProcessing: this.isProcessingQueue,
     };
   }
 }
