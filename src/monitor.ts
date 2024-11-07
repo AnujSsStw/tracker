@@ -1,9 +1,9 @@
 import { AssetTransfersCategory } from "alchemy-sdk";
-import { Mutex } from "async-mutex";
 import { Bot } from "./bot";
 import { alchemy, EtherscanAPI } from "./ether-scan";
 import { logger } from "./logger";
 import type { Config, EtherscanTxInternal } from "./types";
+import { sleep } from "bun";
 
 interface PatternAnalysis {
   type:
@@ -29,8 +29,6 @@ export class TransactionMonitor {
   private etherscanApi: EtherscanAPI;
   private config: Config;
   private minTransactions = 20;
-
-  private mutex = new Mutex();
 
   constructor(config: Config) {
     this.config = config;
@@ -118,172 +116,207 @@ export class TransactionMonitor {
       // Wait for all transaction fetches to complete
       const contractTransactions = await Promise.all(transactionPromises);
 
-      // Step 2: Process transactions and prepare messages in parallel
-      const processingPromises = contractTransactions
-        .filter(({ transactions }) => transactions.length > 0)
-        .map(async ({ name, transactions, totalFound, maxBlock }) => {
-          try {
-            console.log(
-              `\nProcessing ${
-                transactions.length
-              } out of ${totalFound} transactions for ${name}${
-                totalFound > limit ? " (limited to latest 5)" : ""
-              }`
-            );
+      let noOfCalls = 0;
+      const results = [];
 
-            // Group transactions by block
-            const txsByBlock = transactions.reduce(
-              (acc: Record<string, EtherscanTxInternal[]>, tx) => {
-                if (!acc[tx.blockNumber]) {
-                  acc[tx.blockNumber] = [];
-                }
-                acc[tx.blockNumber].push(tx);
-                return acc;
-              },
-              {}
-            );
+      // Process each contract's transactions sequentially
+      for (const {
+        name,
+        transactions,
+        totalFound,
+        maxBlock,
+      } of contractTransactions.filter(
+        ({ transactions }) => transactions.length > 0
+      )) {
+        try {
+          console.log(
+            `\nProcessing ${
+              transactions.length
+            } out of ${totalFound} transactions for ${name}${
+              totalFound > limit ? " (limited to latest 5)" : ""
+            }`
+          );
 
-            console.log(
-              `Found ${
-                Object.keys(txsByBlock).length
-              } blocks and block is ${Object.keys(txsByBlock)}`
-            );
+          // Group transactions by block
+          const txsByBlock = transactions.reduce(
+            (acc: Record<string, EtherscanTxInternal[]>, tx) => {
+              if (!acc[tx.blockNumber]) {
+                acc[tx.blockNumber] = [];
+              }
+              acc[tx.blockNumber].push(tx);
+              return acc;
+            },
+            {}
+          );
 
-            // Process each block's transactions and prepare messages
-            const messages: string[] = [];
-            const copyWalletMessages: string[] = [];
+          console.log(
+            `Found ${
+              Object.keys(txsByBlock).length
+            } blocks and block is ${Object.keys(txsByBlock)}`
+          );
 
-            await Promise.all(
-              Object.entries(txsByBlock).map(async ([blockNum, blockTxs]) => {
-                if (
-                  blockTxs.length >= this.minTransactions &&
-                  blockTxs.every(
-                    (tx) =>
-                      parseFloat(tx.value) / 1e18 >=
-                      this.config.MIN_TRANSACTION_AMOUNT
-                  )
-                ) {
-                  const randomWallets = blockTxs
-                    .map((tx) => tx.to)
-                    .sort(() => 0.5 - Math.random())
-                    .slice(0, 1);
+          // Process each block's transactions and prepare messages
+          const messages: string[] = [];
+          const copyWalletMessages: string[] = [];
 
-                  if (
-                    await this.checkOldTransactions(
-                      randomWallets,
-                      blockTxs[0].from
-                    )
-                  ) {
-                    blockTxs.forEach((tx) => {
-                      console.log(
-                        `Old wallet detected: ${tx.to} with hash ${tx.hash}`
-                      );
-                    });
-                    return;
-                  }
+          // Process blocks sequentially
+          for (const [blockNum, blockTxs] of Object.entries(txsByBlock)) {
+            if (
+              blockTxs.length >= this.minTransactions &&
+              blockTxs.every(
+                (tx) =>
+                  parseFloat(tx.value) / 1e18 >=
+                  this.config.MIN_TRANSACTION_AMOUNT
+              )
+            ) {
+              const randomWallets = blockTxs
+                .map((tx) => tx.to)
+                .filter((value, index, self) => self.indexOf(value) === index)
+                .sort(() => Math.random() - 0.5)
+                .slice(0, 2);
 
-                  console.log(
-                    `Processing block ${blockNum} with ${blockTxs.length} transactions`
-                  );
-                  const totalEth = blockTxs.reduce(
-                    (sum, tx) => sum + parseFloat(tx.value) / 1e18,
-                    0
-                  );
-                  const values = blockTxs.map(
-                    (tx) => parseFloat(tx.value) / 1e18
-                  );
-                  const pattern = this.detectPattern(values);
+              // Rate limiting for API calls
+              if (noOfCalls >= 10) {
+                console.log("Too many calls, waiting for 1 sec");
+                await sleep(1100);
+                noOfCalls = 0;
+              }
+              noOfCalls++;
 
-                  messages.push(
-                    this.createMessage(
-                      name,
-                      blockTxs,
-                      blockNum,
-                      totalEth,
-                      pattern
-                    )
-                  );
+              const isOldWallet = await this.checkOldTransactions(
+                // do 2 api calls per block
+                randomWallets,
+                blockTxs[0].from
+              );
 
-                  const minReceiver = this.findMinEthReceiver(blockTxs);
-                  copyWalletMessages.push(
-                    `Wallet that received least ETH in range: \`${minReceiver.value} ETH\` → \`(${minReceiver.to})\`[View Wallet](https://app.zerion.io/${minReceiver.to}/history)`
-                  );
-                }
-              })
-            );
+              if (isOldWallet) {
+                console.log(
+                  `Old wallet detected: ${blockTxs[0].to} with hash ${blockTxs[0].hash}`
+                );
+                continue;
+              }
 
-            return {
-              name,
-              messages,
+              // Process valid transactions
+              console.log(
+                `Processing block ${blockNum} with ${blockTxs.length} transactions`
+              );
+              const totalEth = blockTxs.reduce(
+                (sum, tx) => sum + parseFloat(tx.value) / 1e18,
+                0
+              );
+              const values = blockTxs.map((tx) => parseFloat(tx.value) / 1e18);
+              const pattern = this.detectPattern(values);
+
+              const msg = this.createMessage(
+                name,
+                blockTxs,
+                blockNum,
+                totalEth,
+                pattern
+              );
+
+              if (msg.length > 4096) {
+                // divide into multiple messages
+                const chunks = this.splitMessage(msg);
+                messages.push(...chunks);
+              } else {
+                messages.push(msg);
+              }
+
+              const minReceiver = this.findMinEthReceiver(blockTxs);
+              copyWalletMessages.push(
+                `Wallet that received least ETH in block ${minReceiver.block} : \`${minReceiver.value} ETH\` → \`${minReceiver.to}\` [View Wallet](https://app.zerion.io/${minReceiver.to}/history)`
+              );
+            }
+          }
+
+          results.push({
+            name,
+            messages,
+            copyWalletMessages,
+            maxBlock: maxBlock ? maxBlock + 1 : currentBlock,
+          });
+        } catch (error) {
+          console.error(`Error processing transactions for ${name}:`, error);
+          results.push({
+            name,
+            messages: [],
+            copyWalletMessages: [],
+            maxBlock: this.contractStats[name].lastBlockChecked,
+          });
+        }
+      }
+
+      // Step 3: Send messages sequentially and update block numbers
+      for (const { name, messages, copyWalletMessages, maxBlock } of results) {
+        try {
+          if (messages.length > 0) {
+            await this.bot.sendMessage(messages, this.config.MAIN_CHAT_ID);
+          }
+
+          if (copyWalletMessages.length > 0) {
+            await this.bot.sendMessage(
               copyWalletMessages,
-              maxBlock: maxBlock ? maxBlock + 1 : currentBlock,
-            };
-          } catch (error) {
-            console.error(`Error processing transactions for ${name}:`, error);
-            return {
-              name,
-              messages: [] as string[],
-              copyWalletMessages: [],
-              maxBlock: this.contractStats[name].lastBlockChecked,
-            };
+              this.config.COPY_WALLET_CHAT_ID
+            );
           }
-        });
 
-      // Wait for all processing to complete
-      const results = await Promise.all(processingPromises);
-
-      // Step 3: Send messages in parallel and update block numbers
-      await Promise.all(
-        results.map(
-          async ({ name, messages, copyWalletMessages, maxBlock }) => {
-            const sendPromises: Promise<void>[] = [];
-
-            if (messages.length > 0) {
-              // if (messages.length > limit) {
-              //   messages.unshift(
-              //     `⚠️ Found \`${messages.length}\` transactions. Showing latest 5 only.`
-              //   );
-              // }
-              sendPromises.push(
-                this.bot.sendMessage(messages, this.config.MAIN_CHAT_ID)
-              );
-            }
-
-            if (copyWalletMessages.length > 0) {
-              sendPromises.push(
-                this.bot.sendMessage(
-                  copyWalletMessages,
-                  this.config.COPY_WALLET_CHAT_ID
-                )
-              );
-            }
-
-            // Wait for messages to be sent
-            await Promise.all(sendPromises);
-
-            // Update last checked block
-            this.contractStats[name].lastBlockChecked = maxBlock;
-          }
-        )
-      );
+          // Update last checked block
+          this.contractStats[name].lastBlockChecked = maxBlock;
+        } catch (error) {
+          console.error(`Error processing results for ${name}:`, error);
+        }
+      }
 
       // Update contracts with no transactions
       contractTransactions
         .filter(({ transactions }) => transactions.length === 0)
         .forEach(({ name }) => {
           this.contractStats[name].lastBlockChecked = currentBlock;
-          console.log(`No transactions found for ${name}`);
+          console.log(
+            `No transactions found for ${name} in block ${currentBlock}`
+          );
         });
     } catch (error: any) {
       console.error("Error in monitoring:", error.message);
     }
   }
 
+  private splitMessage(msg: string, maxLength: number = 4096): string[] {
+    if (msg.length <= maxLength) return [msg];
+
+    const messages: string[] = [];
+    let currentMsg = "";
+
+    // Split the message into header and transactions
+    const [header, ...txLines] = msg.split("\n\n*Transaction: *\n");
+    currentMsg = header + "\n\n*Transaction: *\n";
+
+    // Process transaction lines
+    const transactions = txLines[0].split("\n");
+
+    for (const tx of transactions) {
+      // Check if adding this transaction would exceed the limit
+      if ((currentMsg + tx + "\n").length > maxLength) {
+        messages.push(currentMsg.trim());
+        // Start new message without header
+        currentMsg = tx + "\n";
+      } else {
+        currentMsg += tx + "\n";
+      }
+    }
+
+    if (currentMsg.trim().length > 0) {
+      messages.push(currentMsg.trim());
+    }
+
+    return messages;
+  }
+
   private async checkOldTransactions(
     wallets: string[],
     address: string
   ): Promise<boolean> {
-    const release = await this.mutex.acquire();
     try {
       for (const wallet of wallets) {
         const transactions = await alchemy.core.getAssetTransfers({
@@ -294,15 +327,12 @@ export class TransactionMonitor {
         });
 
         if (transactions.transfers.length > 1) {
-          release();
           return true;
         }
       }
-      release();
       return false;
     } catch (error) {
       console.error("Error checking old transactions:", error);
-      release();
       return false;
     }
   }
@@ -480,6 +510,7 @@ ${blockTxs
   private findMinEthReceiver(transactions: EtherscanTxInternal[]): {
     to: string;
     value: string;
+    block: string;
   } {
     const minTx = transactions.reduce((min, tx) =>
       parseFloat(tx.value) < parseFloat(min.value) ? tx : min
@@ -487,6 +518,7 @@ ${blockTxs
     return {
       to: minTx.to,
       value: (parseFloat(minTx.value) / 1e18).toFixed(4),
+      block: minTx.blockNumber,
     };
   }
 }

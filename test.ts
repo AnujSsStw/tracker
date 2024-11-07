@@ -75,8 +75,8 @@ async function checkOldTransactions(
 //   console.log(result);
 // });
 
-const res = await fetch(
-  `https://api.etherscan.io/api?module=account&action=txlisttxlistinternal&address=${config.ADDRESS.DISPERSE}&startblock=0&endblock=99999999&sort=asc&apikey=${config.ETHERSCAN_API_KEY}`
-);
-const data = await res.json();
-console.log(data);
+// const res = await fetch(
+//   `https://api.etherscan.io/api?module=account&action=txlisttxlistinternal&address=${config.ADDRESS.DISPERSE}&startblock=0&endblock=99999999&sort=asc&apikey=${config.ETHERSCAN_API_KEY}`
+// );
+// const data = await res.json();
+// console.log(data);
